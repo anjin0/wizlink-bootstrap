@@ -8,11 +8,10 @@
 #   - docker 또는 podman (이미지 pull 시)
 #
 # 사용:
-#   ./boot.sh pen.go.kr
-#   ./boot.sh pen.go.kr 'XXXX-XXXX-XXXX-XXXX'
-#   BASE_STRING=pen.go.kr PRODUCT_KEY='...' ./boot.sh
+#   ./boot.sh
+#   (실행 후 사이트 식별자 → 제품키를 순서대로 입력)
 #
-# 주요 환경변수(선택):
+# 주요 환경변수(선택, 배포 동작용 — 식별자/제품키는 대화형 입력만):
 #   BOOTSTRAP_REF=main
 #   GHCR_USER=anjin0
 #   GHCR_IMAGE=ghcr.io/anjin0/wizlink:latest
@@ -121,20 +120,29 @@ decrypt_token() {
     || die "복호화 실패: ${enc_file} (제품키·파일 확인)"
 }
 
-prompt_if_empty() {
+read_required() {
+  # read_required <varname> <prompt> [silent=0]
   local varname="$1"
   local prompt="$2"
   local silent="${3:-0}"
-  local current="${!varname:-}"
-  if [[ -n "${current}" ]]; then
-    return 0
-  fi
-  if [[ "${silent}" == "1" ]]; then
-    read -r -s -p "${prompt}: " current
-    echo
-  else
-    read -r -p "${prompt}: " current
-  fi
+  local current=""
+  while [[ -z "${current}" ]]; do
+    if [[ "${silent}" == "1" ]]; then
+      read -r -s -p "${prompt}: " current
+      echo
+    else
+      read -r -p "${prompt}: " current
+    fi
+    current="$(echo -n "${current}" | tr -d '\r')"
+    if [[ "${silent}" != "1" ]]; then
+      current="$(echo -n "${current}" | tr -d '[:space:]')"
+    else
+      current="$(echo -n "${current}" | tr -d '\n')"
+    fi
+    if [[ -z "${current}" ]]; then
+      echo "입력값이 비어 있습니다. 다시 입력하세요." >&2
+    fi
+  done
   printf -v "${varname}" '%s' "${current}"
 }
 
@@ -148,21 +156,17 @@ container_cli() {
   fi
 }
 
-# --- 1) 입력 ---
-BASE_STRING="${1:-${BASE_STRING:-}}"
-PRODUCT_KEY="${2:-${PRODUCT_KEY:-}}"
+# --- 1) 대화형 입력 (인자/환경변수로 식별자·제품키를 받지 않음) ---
+echo "wizlink Bootstrap"
+echo
 
-prompt_if_empty BASE_STRING "기준 문자열(base_string) 예: pen.go.kr"
-prompt_if_empty PRODUCT_KEY "제품키" 1
-
-BASE_STRING="$(echo -n "${BASE_STRING}" | tr -d '[:space:]')"
-PRODUCT_KEY="$(echo -n "${PRODUCT_KEY}" | tr -d '\r\n')"
-
-[[ -n "${BASE_STRING}" ]] || die "기준 문자열이 비어 있습니다."
-[[ -n "${PRODUCT_KEY}" ]] || die "제품키가 비어 있습니다."
+BASE_STRING=""
+PRODUCT_KEY=""
+read_required BASE_STRING "사이트 식별자"
+read_required PRODUCT_KEY "제품키" 1
 
 if [[ ! "${BASE_STRING}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-  die "기준 문자열 형식이 올바르지 않습니다: ${BASE_STRING}"
+  die "사이트 식별자 형식이 올바르지 않습니다: ${BASE_STRING}"
 fi
 
 need_cmd openssl
