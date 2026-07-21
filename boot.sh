@@ -21,6 +21,7 @@
 #   WIZLINK_HOME=/opt/wizlink
 #   SKIP_DOCKER=0               # 1 이면 GHCR login 생략(검증 전용)
 #   SKIP_RELEASE=0              # 1 이면 Release 다운로드·설치 생략(검증 전용)
+#   VERBOSE=0                   # 1 이면 Bootstrap 상세 과정 표시
 
 set -euo pipefail
 
@@ -39,14 +40,26 @@ INSTALL_DIR="${INSTALL_DIR:-./wizlink-release}"
 WIZLINK_HOME="${WIZLINK_HOME:-/opt/wizlink}"
 SKIP_DOCKER="${SKIP_DOCKER:-0}"
 SKIP_RELEASE="${SKIP_RELEASE:-0}"
+VERBOSE="${VERBOSE:-0}"
 
 die() {
-  echo "ERROR: $*" >&2
+  printf '\n[실패] %s\n' "$*" >&2
   exit 1
 }
 
-info() {
-  echo "==> $*"
+detail() {
+  if [[ "${VERBOSE}" == "1" ]]; then
+    printf '      %s\n' "$*"
+  fi
+}
+
+step_done() {
+  local current="$1"
+  local total="$2"
+  local label="$3"
+  local result="${4:-완료}"
+  printf '[%s/%s] %s ........ %s\n' \
+    "${current}" "${total}" "${label}" "${result}"
 }
 
 need_cmd() {
@@ -121,7 +134,7 @@ decrypt_token() {
 }
 
 # --- 1) 대화형 입력 (인자/환경변수로 식별자·제품키를 받지 않음) ---
-echo "wizlink Bootstrap"
+echo "WizLink 설치를 시작합니다."
 echo
 
 [ "$(id -u)" -eq 0 ] || die "root 권한이 필요합니다. sudo로 실행하세요."
@@ -265,9 +278,9 @@ DEPLOY_ENC_URL="${BOOTSTRAP_BASE_URL}/keys/${BASE_STRING}.deploy.enc"
 GHCR_ENC_FILE="${WORKDIR}/${BASE_STRING}.ghcr.enc"
 DEPLOY_ENC_FILE="${WORKDIR}/${BASE_STRING}.deploy.enc"
 
-info "Bootstrap: ${BOOTSTRAP_OWNER}/${BOOTSTRAP_REPO}@${BOOTSTRAP_REF}"
-info "base_string: ${BASE_STRING}"
-info "암호문 다운로드..."
+detail "Bootstrap: ${BOOTSTRAP_OWNER}/${BOOTSTRAP_REPO}@${BOOTSTRAP_REF}"
+detail "사이트 식별자: ${BASE_STRING}"
+detail "암호화된 배포 인증정보 다운로드"
 
 download "${GHCR_ENC_URL}" "${GHCR_ENC_FILE}"
 download "${DEPLOY_ENC_URL}" "${DEPLOY_ENC_FILE}"
@@ -279,28 +292,32 @@ if grep -qi '<html' "${GHCR_ENC_FILE}" 2>/dev/null; then
 fi
 
 # --- 3) openssl 복호화 ---
-info "openssl 복호화..."
 GHCR_TOKEN="$(decrypt_token "${GHCR_ENC_FILE}" "${PRODUCT_KEY}" | tr -d '\r\n')"
 DEPLOY_TOKEN="$(decrypt_token "${DEPLOY_ENC_FILE}" "${PRODUCT_KEY}" | tr -d '\r\n')"
 
 [[ -n "${GHCR_TOKEN}" ]] || die "GHCR_TOKEN 복호화 결과가 비어 있습니다."
 [[ -n "${DEPLOY_TOKEN}" ]] || die "DEPLOY_TOKEN 복호화 결과가 비어 있습니다."
 unset PRODUCT_KEY
-info "token 복호화 완료(현재 Bootstrap 프로세스에서만 사용)"
 
 AUTH_HDR=(-H "Authorization: Bearer ${DEPLOY_TOKEN}" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
 
 # --- 4) GHCR 로그인 ---
 if [[ "${SKIP_DOCKER}" != "1" ]]; then
-  info "GHCR login (docker / ghcr.io / user=${GHCR_USER})..."
-  printf '%s\n' "${GHCR_TOKEN}" |
+  DOCKER_LOGIN_LOG="${WORKDIR}/docker-login.log"
+  if ! printf '%s\n' "${GHCR_TOKEN}" |
     docker login ghcr.io -u "${GHCR_USER}" --password-stdin \
-    || die "ghcr.io 로그인 실패"
-  info "이미지 3종 pull은 검증된 bundle의 install.sh가 수행합니다."
+      >"${DOCKER_LOGIN_LOG}" 2>&1; then
+    sed 's/^/      /' "${DOCKER_LOGIN_LOG}" >&2
+    die "GHCR 로그인에 실패했습니다."
+  fi
+  if [[ "${VERBOSE}" == "1" ]]; then
+    sed 's/^/      /' "${DOCKER_LOGIN_LOG}"
+  fi
 else
-  info "SKIP_DOCKER=1 — GHCR login 생략(일회용 검증 전용)"
+  detail "SKIP_DOCKER=1 — GHCR login 생략(일회용 검증 전용)"
 fi
 unset GHCR_TOKEN
+step_done 1 4 "배포 인증 확인"
 
 # --- 5) wizlink-deploy Release 자산 다운로드 ---
 if [[ "${SKIP_RELEASE}" != "1" ]]; then
@@ -312,7 +329,7 @@ if [[ "${SKIP_RELEASE}" != "1" ]]; then
     RELEASE_API="https://api.github.com/repos/${DEPLOY_OWNER}/${DEPLOY_REPO}/releases/tags/${RELEASE_TAG}"
   fi
 
-  info "Release 조회: ${DEPLOY_OWNER}/${DEPLOY_REPO} (${RELEASE_TAG})"
+  detail "Release 조회: ${DEPLOY_OWNER}/${DEPLOY_REPO} (${RELEASE_TAG})"
   RELEASE_JSON="${WORKDIR}/release.json"
   http_get "${RELEASE_API}" "${AUTH_HDR[@]}" > "${RELEASE_JSON}" \
     || die "Release API 호출 실패 (토큰·저장소·태그 확인)"
@@ -357,7 +374,7 @@ PY
   VERSION="${TAG_NAME#v}"
   BUNDLE_NAME="wizlink-${VERSION}-linux-amd64-deploy"
   ARCHIVE_NAME="${BUNDLE_NAME}.tar.gz"
-  info "Release tag: ${TAG_NAME}"
+  step_done 2 4 "릴리스 확인" "${TAG_NAME}"
 
   if [[ ${#ASSET_IDS[@]} -eq 0 ]]; then
     die "Release 자산(assets)이 없습니다: ${DEPLOY_OWNER}/${DEPLOY_REPO} ${TAG_NAME}"
@@ -365,13 +382,13 @@ PY
 
   mkdir -p "${INSTALL_DIR}"
   INSTALL_DIR="$(cd "${INSTALL_DIR}" && pwd)"
-  info "자산 다운로드 → ${INSTALL_DIR}/"
+  detail "Release 자산 다운로드: ${INSTALL_DIR}/"
 
   for i in "${!ASSET_IDS[@]}"; do
     name="${ASSET_NAMES[$i]}"
     url="${ASSET_URLS[$i]}"
     dest="${INSTALL_DIR}/${name}"
-    info "  - ${name}"
+    detail "다운로드: ${name}"
     # private/public 공통: API asset URL + octet-stream
     download "${url}" "${dest}" \
       -H "Authorization: Bearer ${DEPLOY_TOKEN}" \
@@ -385,7 +402,7 @@ PY
       die "필수 Release 자산이 없습니다: ${required_asset}"
   done
 
-  info "Release metadata와 checksum 계약 검증..."
+  detail "Release metadata와 checksum 계약 검증"
   python3 - \
     "${INSTALL_DIR}/manifest.json" \
     "${INSTALL_DIR}/SHA256SUMS" \
@@ -440,10 +457,10 @@ if manifest.get("bundle_sha256", "").lower() != checksums[expected_archive]:
 PY
   (
     cd "${INSTALL_DIR}"
-    sha256sum -c SHA256SUMS
+    sha256sum --quiet -c SHA256SUMS
   ) || die "Release 외부 checksum 검증에 실패했습니다."
 
-  info "bundle archive 구조 검증..."
+  detail "bundle archive 구조 검증"
   python3 - "${INSTALL_DIR}/${ARCHIVE_NAME}" "${BUNDLE_NAME}" <<'PY'
 import sys
 import tarfile
@@ -468,7 +485,7 @@ PY
 
   BUNDLE_ROOT="${INSTALL_DIR}/${BUNDLE_NAME}"
   if [[ -e "${BUNDLE_ROOT}" ]]; then
-    info "기존 동일 version bundle 디렉터리를 검증된 archive로 교체: ${BUNDLE_ROOT}"
+    detail "기존 동일 version bundle을 검증된 archive로 교체: ${BUNDLE_ROOT}"
     rm -rf -- "${BUNDLE_ROOT}"
   fi
   tar -xzf "${INSTALL_DIR}/${ARCHIVE_NAME}" -C "${INSTALL_DIR}"
@@ -486,22 +503,25 @@ EOF
 
   unset DEPLOY_TOKEN
   AUTH_HDR=()
-  info "Release 검증·압축 해제 완료: ${BUNDLE_ROOT}"
-  info "bundle install.sh 실행(version=${VERSION}, home=${WIZLINK_HOME})"
+  step_done 3 4 "설치 파일 다운로드 및 검증"
+  echo
+  printf 'WizLink %s 환경 구성을 시작합니다.\n\n' "${VERSION}"
   "${BUNDLE_ROOT}/install.sh" \
     --prod \
     --home-dir "${WIZLINK_HOME}" \
     --version "${VERSION}"
 else
-  info "SKIP_RELEASE=1 — Release 다운로드·설치 생략(일회용 검증 전용)"
+  detail "SKIP_RELEASE=1 — Release 다운로드·설치 생략(일회용 검증 전용)"
 fi
 
 # --- 요약 ---
 echo
-info "완료"
-echo "  base_string : ${BASE_STRING}"
 if [[ "${SKIP_RELEASE}" != "1" ]]; then
-  echo "  release     : ${TAG_NAME}"
-  echo "  bundle      : ${BUNDLE_ROOT}"
-  echo "  runtime     : ${WIZLINK_HOME}"
+  step_done 4 4 "WizLink 서비스 설치"
+  echo
+  printf 'WizLink %s 설치가 완료되었습니다.\n' "${VERSION}"
+  printf '설치 경로: %s\n' "${WIZLINK_HOME}"
+  printf '사이트 식별자: %s\n' "${BASE_STRING}"
+else
+  echo "Bootstrap 검증이 완료되었습니다."
 fi
