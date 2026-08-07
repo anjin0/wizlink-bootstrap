@@ -33,14 +33,28 @@ sudo bash /tmp/boot.sh v1.2.3     # 특정 버전
 
 설치 중에는 진행 상황이 `[1/4] ~ [4/4]`로 표시되고, 완료되면 설치 버전과 경로가 출력됩니다.
 
+## 설치 직후 할 일: 수집기 기동
+
+트래픽 수집기는 설치되지만 **자동으로 시작되지 않습니다.** 설치 시점에는 등록된 장비가 없어
+수집할 대상이 없기 때문입니다. 웹 화면에서 장비 등록을 마친 뒤 기동하세요.
+
+```bash
+sudo wizlinkctl collector start    # 기동 (재부팅 후 자동 시작 포함)
+sudo wizlinkctl collector status   # 기동 상태와 health 확인
+sudo wizlinkctl collector stop     # 중지 (재부팅 후에도 멈춘 상태 유지)
+```
+
 ## 설치 후 운영
 
 ```bash
-sudo wizlinkctl status            # 현재 버전, 컨테이너, 최근 배포 이력
+sudo wizlinkctl status            # 현재 버전, 컨테이너, 수집기, 최근 배포 이력
 sudo wizlinkctl upgrade v1.3.0    # 상위 버전으로 갱신
 sudo wizlinkctl rollback v1.2.3   # 이전 버전으로 복귀
 sudo wizlinkctl uninstall         # 제거
 ```
+
+업그레이드와 롤백은 수집기 버전도 함께 바꾸지만 **기동 여부는 그대로 둡니다.** 돌고 있었으면
+새 버전으로 계속 돌고, 멈춰 있었으면 멈춘 채로 남습니다.
 
 `boot.sh`에 `install` / `upgrade` / `rollback` 같은 하위 명령을 붙이는 예전 방식은 더 이상
 동작하지 않습니다. 그렇게 실행하면 `wizlinkctl`을 쓰라는 안내와 함께 중단됩니다.
