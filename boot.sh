@@ -1,27 +1,40 @@
 #!/usr/bin/env bash
-# WizLink Bootstrap — 운영 서버 배포 진입 스크립트 (Rocky Linux / RHEL 계열)
+# WizLink Bootstrap — 최초 설치 진입점 (Rocky Linux / RHEL 계열)
+#
+# 이 스크립트는 "설치 이전"만 담당한다. 사이트 식별자와 제품키로 배포 인증정보를
+# 복호화하고, wizlink-deploy Release bundle을 내려받아 신원(checksum·archive 구조)을
+# 확인한 뒤, bundle 안의 wizlinkctl에 설치를 인계한다.
+#
+# 설치가 끝나면 wizlinkctl이 /opt/wizlink/bin/wizlinkctl과 /usr/local/bin/wizlinkctl로
+# 심어지므로, 이후 운영은 boot.sh를 다시 받지 않고 다음으로 수행한다.
+#
+#   sudo wizlinkctl status
+#   sudo wizlinkctl upgrade vX.Y.Z
+#   sudo wizlinkctl rollback vX.Y.Z
+#   sudo wizlinkctl uninstall
+#
+# wizlinkctl이 손상되면 이 스크립트를 현재 버전으로 다시 실행해 복구한다
+# (install.sh는 재실행 안전하며 운영 진입점을 다시 심는다).
 #
 # 필요:
 #   - openssl
 #   - curl 또는 wget
-#   - python3 (Release JSON·manifest·archive 검증)
+#   - python3 (Release JSON·checksum·archive 검증)
 #   - sha256sum, tar
 #   - Docker Engine과 Docker Compose plugin
 #
 # 사용:
-#   ./boot.sh                         # 최초 설치(latest)
-#   ./boot.sh install [v1.2.3]
-#   ./boot.sh upgrade v1.2.3
-#   ./boot.sh rollback v1.1.0
+#   ./boot.sh                  # 안정 Release latest 설치
+#   ./boot.sh v1.2.3           # 지정 버전 설치
 #   (실행 후 사이트 식별자 → 제품키를 순서대로 입력)
 #
 # 주요 환경변수(선택, 배포 동작용 — 식별자/제품키는 대화형 입력만):
 #   BOOTSTRAP_REF=main
 #   GHCR_USER=anjin0
 #   DEPLOY_OWNER=anjin0  DEPLOY_REPO=wizlink-deploy
-#   RELEASE_TAG=latest          # install에서만 사용; CLI tag가 우선
-#   INSTALL_DIR=/opt/wizlink/releases
+#   RELEASE_TAG=latest          # CLI tag가 우선
 #   WIZLINK_HOME=/opt/wizlink
+#   INSTALL_DIR=$WIZLINK_HOME/releases
 #   SKIP_DOCKER=0               # 1 이면 GHCR login 생략(검증 전용)
 #   SKIP_RELEASE=0              # 1 이면 Release 다운로드·설치 생략(검증 전용)
 #   VERBOSE=0                   # 1 이면 Bootstrap 상세 과정 표시
@@ -39,13 +52,11 @@ RELEASE_TAG="${RELEASE_TAG:-latest}"
 
 GHCR_USER="${GHCR_USER:-anjin0}"
 
-INSTALL_DIR="${INSTALL_DIR:-/opt/wizlink/releases}"
 WIZLINK_HOME="${WIZLINK_HOME:-/opt/wizlink}"
+INSTALL_DIR="${INSTALL_DIR:-${WIZLINK_HOME}/releases}"
 SKIP_DOCKER="${SKIP_DOCKER:-0}"
 SKIP_RELEASE="${SKIP_RELEASE:-0}"
 VERBOSE="${VERBOSE:-0}"
-ACTION="install"
-REQUESTED_TAG=""
 CURRENT_VERSION=""
 RELEASE_STAGE_DIR=""
 
@@ -72,15 +83,17 @@ step_done() {
 usage() {
   cat <<'EOF'
 사용법:
-  boot.sh
-  boot.sh install [vX.Y.Z]
-  boot.sh upgrade vX.Y.Z
-  boot.sh rollback vX.Y.Z
+  boot.sh [vX.Y.Z]
 
-명령:
-  install   WizLink를 처음 설치합니다. tag를 생략하면 안정 Release latest를 사용합니다.
-  upgrade   설치된 WizLink를 지정한 상위 또는 동일 버전으로 갱신합니다.
-  rollback  DB 호환성이 확인되는 지정한 하위 또는 동일 버전으로 되돌립니다.
+  WizLink를 처음 설치합니다. tag를 생략하면 안정 Release latest를 사용합니다.
+
+설치 이후의 업그레이드·롤백·제거·상태 조회는 이 스크립트가 아니라
+서버에 설치되는 wizlinkctl로 수행합니다.
+
+  sudo wizlinkctl status
+  sudo wizlinkctl upgrade vX.Y.Z
+  sudo wizlinkctl rollback vX.Y.Z
+  sudo wizlinkctl uninstall
 EOF
 }
 
@@ -88,53 +101,7 @@ semver_valid_tag() {
   [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]
 }
 
-semver_compare() {
-  python3 - "$1" "$2" <<'PY'
-import re
-import sys
-
-
-def parse(value):
-    match = re.fullmatch(
-        r"([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z][0-9A-Za-z.-]*))?",
-        value,
-    )
-    if not match:
-        raise SystemExit(f"잘못된 SemVer: {value}")
-    core = tuple(int(part) for part in match.group(1, 2, 3))
-    prerelease = match.group(4)
-    return core, None if prerelease is None else prerelease.split(".")
-
-
-def compare_identifiers(left, right):
-    for left_part, right_part in zip(left, right):
-        if left_part == right_part:
-            continue
-        left_numeric = left_part.isdigit()
-        right_numeric = right_part.isdigit()
-        if left_numeric and right_numeric:
-            return -1 if int(left_part) < int(right_part) else 1
-        if left_numeric != right_numeric:
-            return -1 if left_numeric else 1
-        return -1 if left_part < right_part else 1
-    return (len(left) > len(right)) - (len(left) < len(right))
-
-
-left_core, left_pre = parse(sys.argv[1])
-right_core, right_pre = parse(sys.argv[2])
-if left_core != right_core:
-    print(-1 if left_core < right_core else 1)
-elif left_pre is None and right_pre is None:
-    print(0)
-elif left_pre is None:
-    print(1)
-elif right_pre is None:
-    print(-1)
-else:
-    print(compare_identifiers(left_pre, right_pre))
-PY
-}
-
+# 검증이 끝난 staging과 기존 version 보관본을 Linux renameat2로 원자 교체한다.
 activate_release_dir() {
   local staged_dir="$1"
   local release_dir="$2"
@@ -180,39 +147,19 @@ parse_cli() {
     exit 0
   fi
 
-  if [[ "$#" -gt 0 ]]; then
-    ACTION="$1"
-    shift
-  fi
-
-  case "${ACTION}" in
-    install)
-      [[ "$#" -le 1 ]] || { usage >&2; exit 2; }
-      if [[ "$#" -eq 1 ]]; then
-        REQUESTED_TAG="$1"
-        RELEASE_TAG="${REQUESTED_TAG}"
-      fi
-      ;;
-    upgrade | rollback)
-      [[ "$#" -eq 1 ]] || { usage >&2; exit 2; }
-      REQUESTED_TAG="$1"
-      RELEASE_TAG="${REQUESTED_TAG}"
-      ;;
-    *)
-      usage >&2
-      exit 2
+  case "${1:-}" in
+    install | upgrade | rollback)
+      die "boot.sh는 최초 설치만 수행합니다. '${1}'은(는) wizlinkctl로 실행하세요: sudo wizlinkctl ${1} ..."
       ;;
   esac
 
-  if [[ -n "${REQUESTED_TAG}" ]] && ! semver_valid_tag "${REQUESTED_TAG}"; then
-    die "명시한 Release tag는 vX.Y.Z 형식이어야 합니다: ${REQUESTED_TAG}"
+  [[ "$#" -le 1 ]] || { usage >&2; exit 2; }
+  if [[ "$#" -eq 1 ]]; then
+    RELEASE_TAG="$1"
   fi
-  if [[ -z "${REQUESTED_TAG}" && "${RELEASE_TAG}" != "latest" ]] &&
-    ! semver_valid_tag "${RELEASE_TAG}"; then
+
+  if [[ "${RELEASE_TAG}" != "latest" ]] && ! semver_valid_tag "${RELEASE_TAG}"; then
     die "Release tag는 vX.Y.Z 형식이어야 합니다: ${RELEASE_TAG}"
-  fi
-  if [[ "${ACTION}" != "install" && "${RELEASE_TAG}" == "latest" ]]; then
-    die "${ACTION}에는 명시적 Release tag가 필요합니다."
   fi
 }
 
@@ -222,43 +169,27 @@ read_env_value() {
   sed -nE "s/^${key}=(.*)$/\1/p" "${env_file}" | tail -n 1
 }
 
+# 최초 설치 전용이므로, 기존 설치가 있으면 중단된 설치의 재실행만 허용한다.
+# 버전 변경은 wizlinkctl upgrade / rollback의 몫이다.
 check_runtime_state() {
   local env_file="${WIZLINK_HOME}/.env"
-  local runtime_environment comparison target_version
+  local runtime_environment
 
-  if [[ ! -f "${env_file}" ]]; then
-    [[ "${ACTION}" == "install" ]] ||
-      die "${ACTION}할 WizLink 운영 설치를 찾지 못했습니다: ${env_file}"
-    return
-  fi
+  [[ -f "${env_file}" ]] || return 0
 
   runtime_environment="$(read_env_value WIZLINK_ENV "${env_file}")"
   [[ "${runtime_environment}" == "production" ]] ||
-    die "운영 설치만 ${ACTION}할 수 있습니다: WIZLINK_ENV=${runtime_environment:-없음}"
+    die "운영 설치만 재실행할 수 있습니다: WIZLINK_ENV=${runtime_environment:-없음}"
   CURRENT_VERSION="$(read_env_value WIZLINK_VERSION "${env_file}")"
 
-  if [[ "${ACTION}" == "install" ]]; then
-    if [[ -z "${CURRENT_VERSION}" ]]; then
-      detail "부분 설치 복구: .env에 WIZLINK_VERSION이 없어 install 재실행을 허용합니다."
-      return
-    fi
-    [[ "${CURRENT_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] ||
-      die "현재 WIZLINK_VERSION이 올바르지 않습니다: ${CURRENT_VERSION}"
-    if [[ "${RELEASE_TAG}" != "latest" && "${RELEASE_TAG#v}" != "${CURRENT_VERSION}" ]]; then
-      die "install로 버전을 변경할 수 없습니다: ${CURRENT_VERSION} -> ${RELEASE_TAG#v}. upgrade를 사용하세요."
-    fi
-    return
+  if [[ -z "${CURRENT_VERSION}" ]]; then
+    detail "부분 설치 복구: .env에 WIZLINK_VERSION이 없어 재실행을 허용합니다."
+    return 0
   fi
-
   [[ "${CURRENT_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] ||
-    die "현재 WIZLINK_VERSION이 올바르지 않습니다: ${CURRENT_VERSION:-없음}"
-  target_version="${RELEASE_TAG#v}"
-  comparison="$(semver_compare "${target_version}" "${CURRENT_VERSION}")"
-  if [[ "${ACTION}" == "upgrade" && "${comparison}" -lt 0 ]]; then
-    die "낮은 버전으로 upgrade할 수 없습니다: ${CURRENT_VERSION} -> ${target_version}"
-  fi
-  if [[ "${ACTION}" == "rollback" && "${comparison}" -gt 0 ]]; then
-    die "높은 버전으로 rollback할 수 없습니다: ${CURRENT_VERSION} -> ${target_version}"
+    die "현재 WIZLINK_VERSION이 올바르지 않습니다: ${CURRENT_VERSION}"
+  if [[ "${RELEASE_TAG}" != "latest" && "${RELEASE_TAG#v}" != "${CURRENT_VERSION}" ]]; then
+    die "boot.sh로 버전을 변경할 수 없습니다: ${CURRENT_VERSION} -> ${RELEASE_TAG#v}. 'sudo wizlinkctl upgrade ${RELEASE_TAG}'를 사용하세요."
   fi
 }
 
@@ -336,13 +267,7 @@ decrypt_token() {
 parse_cli "$@"
 
 # --- 1) 대화형 입력 (인자/환경변수로 식별자·제품키를 받지 않음) ---
-case "${ACTION}" in
-  install) ACTION_LABEL="설치" ;;
-  upgrade) ACTION_LABEL="업그레이드" ;;
-  rollback) ACTION_LABEL="롤백" ;;
-esac
-
-echo "WizLink ${ACTION_LABEL}를 시작합니다."
+echo "WizLink 설치를 시작합니다."
 echo
 
 [ "$(id -u)" -eq 0 ] || die "root 권한이 필요합니다. sudo로 실행하세요."
@@ -533,8 +458,6 @@ step_done 1 4 "배포 인증 확인"
 
 # --- 5) wizlink-deploy Release 자산 다운로드 ---
 if [[ "${SKIP_RELEASE}" != "1" ]]; then
-  need_cmd python3
-
   if [[ "${RELEASE_TAG}" == "latest" ]]; then
     RELEASE_API="https://api.github.com/repos/${DEPLOY_OWNER}/${DEPLOY_REPO}/releases/latest"
   else
@@ -581,14 +504,14 @@ PY
   done
 
   [[ -n "${TAG_NAME}" ]] || die "Release 태그명을 얻지 못했습니다."
-  [[ "${TAG_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] ||
+  semver_valid_tag "${TAG_NAME}" ||
     die "Release tag가 지원하는 SemVer 형식이 아닙니다: ${TAG_NAME}"
   if [[ "${RELEASE_TAG}" != "latest" && "${TAG_NAME}" != "${RELEASE_TAG}" ]]; then
     die "조회된 Release tag가 요청과 다릅니다: 요청=${RELEASE_TAG}, 응답=${TAG_NAME}"
   fi
   VERSION="${TAG_NAME#v}"
-  if [[ "${ACTION}" == "install" && -n "${CURRENT_VERSION}" && "${VERSION}" != "${CURRENT_VERSION}" ]]; then
-    die "install로 버전을 변경할 수 없습니다: ${CURRENT_VERSION} -> ${VERSION}. upgrade를 사용하세요."
+  if [[ -n "${CURRENT_VERSION}" && "${VERSION}" != "${CURRENT_VERSION}" ]]; then
+    die "boot.sh로 버전을 변경할 수 없습니다: ${CURRENT_VERSION} -> ${VERSION}. 'sudo wizlinkctl upgrade ${TAG_NAME}'를 사용하세요."
   fi
   BUNDLE_NAME="wizlink-${VERSION}-linux-amd64-deploy"
   ARCHIVE_NAME="${BUNDLE_NAME}.tar.gz"
@@ -629,11 +552,12 @@ PY
       die "필수 Release 자산이 없습니다: ${required_asset}"
   done
 
-  detail "Release metadata와 checksum 계약 검증"
+  # 여기서는 "이 bundle이 우리가 게시한 그 파일인가"만 확인한다. 이미지 세트 등
+  # 제품 규약에 해당하는 manifest 계약 검증은 bundle과 함께 배포되는 wizlinkctl이 한다.
+  detail "Release checksum 목록과 bundle checksum 대조"
   python3 - \
     "${RELEASE_STAGE_DIR}/manifest.json" \
     "${RELEASE_STAGE_DIR}/SHA256SUMS" \
-    "${VERSION}" \
     "${ARCHIVE_NAME}" <<'PY'
 import json
 import re
@@ -642,30 +566,10 @@ from pathlib import Path
 
 manifest_path = Path(sys.argv[1])
 checksums_path = Path(sys.argv[2])
-expected_version = sys.argv[3]
-expected_archive = sys.argv[4]
+expected_archive = sys.argv[3]
 
 with manifest_path.open(encoding="utf-8") as stream:
     manifest = json.load(stream)
-
-expected_images = {
-    "backend": f"ghcr.io/anjin0/wizlink-backend:{expected_version}",
-    "nginx": f"ghcr.io/anjin0/wizlink-nginx:{expected_version}",
-    "nettool": f"ghcr.io/anjin0/wizlink-nettool:{expected_version}",
-}
-if manifest.get("version") != expected_version:
-    raise SystemExit("manifest version이 Release tag와 다릅니다.")
-if manifest.get("architecture") != "linux/amd64":
-    raise SystemExit("manifest architecture가 linux/amd64가 아닙니다.")
-if manifest.get("bundle") != expected_archive:
-    raise SystemExit("manifest bundle 이름이 Release tag와 다릅니다.")
-if manifest.get("images") != expected_images:
-    raise SystemExit("manifest 이미지 세트가 Release version과 다릅니다.")
-wizcollector = manifest.get("wizcollector") or {}
-if wizcollector.get("version") != expected_version:
-    raise SystemExit("manifest Wizcollector version이 Release tag와 다릅니다.")
-if wizcollector.get("architecture") != "linux/amd64":
-    raise SystemExit("manifest Wizcollector architecture가 linux/amd64가 아닙니다.")
 
 checksums = {}
 for raw_line in checksums_path.read_text(encoding="utf-8").splitlines():
@@ -712,9 +616,8 @@ PY
 
   STAGED_BUNDLE_ROOT="${RELEASE_STAGE_DIR}/${BUNDLE_NAME}"
   tar -xzf "${RELEASE_STAGE_DIR}/${ARCHIVE_NAME}" -C "${RELEASE_STAGE_DIR}"
-  ACTION_SCRIPT="${STAGED_BUNDLE_ROOT}/${ACTION}.sh"
-  [[ -x "${ACTION_SCRIPT}" ]] ||
-    die "bundle ${ACTION}.sh가 없거나 실행 가능하지 않습니다: ${ACTION_SCRIPT}"
+  [[ -x "${STAGED_BUNDLE_ROOT}/wizlinkctl" ]] ||
+    die "bundle에 실행 가능한 wizlinkctl이 없습니다. 이 boot.sh는 wizlinkctl을 포함한 Release에만 사용할 수 있습니다."
   [[ "$(<"${STAGED_BUNDLE_ROOT}/VERSION")" == "${VERSION}" ]] ||
     die "bundle VERSION이 Release tag와 다릅니다."
 
@@ -722,8 +625,8 @@ PY
   cat > "${RELEASE_STAGE_DIR}/.release-info" <<EOF
 repo=${DEPLOY_OWNER}/${DEPLOY_REPO}
 tag=${TAG_NAME}
-base_string=${BASE_STRING}
-mode=${ACTION}
+site=${BASE_STRING}
+mode=install
 EOF
 
   if [[ -e "${RELEASE_DIR}" ]]; then
@@ -737,30 +640,20 @@ EOF
   fi
   RELEASE_STAGE_DIR=""
   BUNDLE_ROOT="${RELEASE_DIR}/${BUNDLE_NAME}"
-  ACTION_SCRIPT="${BUNDLE_ROOT}/${ACTION}.sh"
 
   unset DEPLOY_TOKEN
   AUTH_HDR=()
   step_done 3 4 "배포 파일 다운로드 및 검증"
   echo
-  printf 'WizLink %s %s 작업을 시작합니다.\n' "${VERSION}" "${ACTION_LABEL}"
-  if [[ "${ACTION}" == "rollback" ]]; then
-    printf '데이터베이스는 되돌리지 않으며, 현재 DB와의 호환성 검사를 통과해야 합니다.\n'
-  fi
+  printf 'WizLink %s 설치 작업을 시작합니다.\n' "${VERSION}"
   echo
 
-  case "${ACTION}" in
-    install)
-      "${ACTION_SCRIPT}" \
-        --prod \
-        --home-dir "${WIZLINK_HOME}" \
-        --version "${VERSION}"
-      ;;
-    upgrade | rollback)
-      "${ACTION_SCRIPT}" "${VERSION}" \
-        --home-dir "${WIZLINK_HOME}"
-      ;;
-  esac
+  # 이후는 bundle 소관이다. boot.sh는 install.sh의 호출 규약을 알지 않는다.
+  "${BUNDLE_ROOT}/wizlinkctl" install \
+    --release-dir "${RELEASE_DIR}" \
+    --version "${VERSION}" \
+    --home-dir "${WIZLINK_HOME}" \
+    --site "${BASE_STRING}"
 else
   detail "SKIP_RELEASE=1 — Release 다운로드·배포 생략(일회용 검증 전용)"
 fi
@@ -768,15 +661,18 @@ fi
 # --- 요약 ---
 echo
 if [[ "${SKIP_RELEASE}" != "1" ]]; then
-  step_done 4 4 "WizLink 서비스 ${ACTION_LABEL}"
+  step_done 4 4 "WizLink 서비스 설치"
   echo
-  printf 'WizLink %s %s가 완료되었습니다.\n' "${VERSION}" "${ACTION_LABEL}"
-  if [[ -n "${CURRENT_VERSION}" ]]; then
-    printf '버전 변경: %s -> %s\n' "${CURRENT_VERSION}" "${VERSION}"
-  fi
+  printf 'WizLink %s 설치가 완료되었습니다.\n' "${VERSION}"
   printf '설치 경로: %s\n' "${WIZLINK_HOME}"
   printf 'Release 경로: %s\n' "${RELEASE_DIR}"
   printf '사이트 식별자: %s\n' "${BASE_STRING}"
+  echo
+  printf '이후 운영은 wizlinkctl로 수행합니다.\n'
+  printf '  sudo wizlinkctl status\n'
+  printf '  sudo wizlinkctl upgrade vX.Y.Z\n'
+  printf '  sudo wizlinkctl rollback vX.Y.Z\n'
+  printf '  sudo wizlinkctl uninstall\n'
 else
   echo "Bootstrap 검증이 완료되었습니다."
 fi
